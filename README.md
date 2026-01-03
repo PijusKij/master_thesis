@@ -1,1 +1,1 @@
-# master_thesis
+# Modeling Wearable-Derived Health Indicators with Classical and Foundational Models
