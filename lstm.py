@@ -1,5 +1,8 @@
+import os
+import random
 import numpy as np
 import pandas as pd
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -7,45 +10,70 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-# Load the imputed dataset
-d = pd.read_csv('masters_df_imputed.csv')
 
+# =====================================================
+# 0) REPRODUCIBILITY CONTROLS
+# =====================================================
+SEED = 42
+
+os.environ["PYTHONHASHSEED"] = str(SEED)
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+random.seed(SEED)
+np.random.seed(SEED)
+
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+torch.use_deterministic_algorithms(True)
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+
+# =====================================================
+# 1) Load data
+# =====================================================
+d = pd.read_csv("masters_df_imputed.csv")
 cols = ["user_id", "date", "resting_hr", "rmssd", "age", "sex", "calories", "steps"]
-df = d[cols]
+df = d[cols].copy()
 
-# -----------------------------
-# 1) Prep: cleaning + encoding
-# -----------------------------
+
+# =====================================================
+# 2) Prep: cleaning + encoding (stable)
+# =====================================================
 def prepare_df(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values(["user_id", "date"]).reset_index(drop=True)
+    out = df.copy()
+
+    out["user_id"] = out["user_id"].astype(str)
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
 
     # Encode sex if it's not numeric already
-    if df["sex"].dtype == "object":
-        df["sex"] = (
-            df["sex"].astype(str).str.lower()
+    if "sex" in out.columns and (out["sex"].dtype == "object" or str(out["sex"].dtype).startswith("string")):
+        out["sex"] = (
+            out["sex"].astype(str).str.strip().str.lower()
             .map({"m": 1, "male": 1, "f": 0, "female": 0})
-            .fillna(0).astype(int)
+            .fillna(0)
+            .astype(int)
         )
+    elif "sex" in out.columns:
+        out["sex"] = pd.to_numeric(out["sex"], errors="coerce").fillna(0).astype(int)
 
-    # Ensure weekday numeric 0..6 (Mon=0)
-    #if df["weekday"].dtype == "object":
-    #    wd_map = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6}
-    #    df["weekday"] = df["weekday"].astype(str).str.lower().map(wd_map)
-
-    #df["weekday"] = df["weekday"].astype(int)
+    # Stable ordering
+    out = out.sort_values(["user_id", "date"], kind="mergesort").reset_index(drop=True)
 
     # Drop rows with missing essentials
-    needed = ["user_id","date","rmssd","age","sex"]
-    # other seq features may vary by feature set, so we don't hard-require them here
-    df = df.dropna(subset=needed).reset_index(drop=True)
-    return df
+    needed = ["user_id", "date", "rmssd", "age", "sex"]
+    out = out.dropna(subset=needed).reset_index(drop=True)
+    return out
 
 
-# -----------------------------------------
-# 2) Build sequences for global LSTM dataset
-# -----------------------------------------
+# =====================================================
+# 3) Dataset
+# =====================================================
 class SeqDataset(Dataset):
     def __init__(self, X_seq: np.ndarray, X_static: np.ndarray, y: np.ndarray):
         self.X_seq = torch.tensor(X_seq, dtype=torch.float32)
@@ -59,21 +87,27 @@ class SeqDataset(Dataset):
         return self.X_seq[idx], self.X_static[idx], self.y[idx]
 
 
-# -----------------------------------
-# 3) Time-aware split: train vs test
-# -----------------------------------
-def time_split_indices(df: pd.DataFrame, history_days: int,
-                       seq_features: list, static_features: list,
-                       target_col: str = "rmssd"):
+# =====================================================
+# 4) Time-aware split (deterministic)
+# =====================================================
+def time_split_indices(
+    df: pd.DataFrame,
+    history_days: int,
+    seq_features: list,
+    static_features: list,
+    target_col: str = "rmssd",
+):
     X_seq_tr, X_static_tr, y_tr = [], [], []
     X_seq_te, X_static_te, y_te = [], [], []
 
-    # Require only the columns we actually use for this run
     required_cols = ["user_id", "date", target_col] + seq_features + static_features
     df_run = df.dropna(subset=required_cols).copy()
 
-    for uid, g in df_run.groupby("user_id", sort=False):
-        g = g.sort_values("date").reset_index(drop=True)
+    # Deterministic user iteration order
+    for uid, g in df_run.groupby("user_id", sort=True):
+        g = g.sort_values("date", kind="mergesort").reset_index(drop=True)
+
+        # static features from the first row (matches your original logic)
         s = g.loc[0, static_features].values.astype(float)
 
         valid_t = list(range(history_days - 1, len(g) - 1))
@@ -96,20 +130,19 @@ def time_split_indices(df: pd.DataFrame, history_days: int,
             f"No samples created. Check missingness or history_days={history_days} for chosen features={seq_features}."
         )
 
-    X_seq_tr = np.stack(X_seq_tr, axis=0)
-    X_static_tr = np.stack(X_static_tr, axis=0)
-    y_tr = np.array(y_tr, dtype=float)
+    return (
+        np.stack(X_seq_tr, axis=0),
+        np.stack(X_static_tr, axis=0),
+        np.array(y_tr, dtype=float),
+        np.stack(X_seq_te, axis=0),
+        np.stack(X_static_te, axis=0),
+        np.array(y_te, dtype=float),
+    )
 
-    X_seq_te = np.stack(X_seq_te, axis=0)
-    X_static_te = np.stack(X_static_te, axis=0)
-    y_te = np.array(y_te, dtype=float)
 
-    return X_seq_tr, X_static_tr, y_tr, X_seq_te, X_static_te, y_te
-
-
-# -----------------------------
-# 4) Model: LSTM + static head
-# -----------------------------
+# =====================================================
+# 5) Model: LSTM + static head
+# =====================================================
 class GlobalLSTM(nn.Module):
     def __init__(self, seq_input_dim: int, static_dim: int,
                  hidden_dim: int = 64, num_layers: int = 1, dropout: float = 0.0):
@@ -128,15 +161,15 @@ class GlobalLSTM(nn.Module):
         )
 
     def forward(self, x_seq, x_static):
-        out, (h_n, c_n) = self.lstm(x_seq)
+        _, (h_n, _) = self.lstm(x_seq)
         h_last = h_n[-1]
         x = torch.cat([h_last, x_static], dim=1)
         return self.head(x)
 
 
-# -----------------------------
-# 5) Train + evaluate utilities
-# -----------------------------
+# =====================================================
+# 6) Train + predict utilities
+# =====================================================
 def train_model(model, train_loader, lr=1e-3, epochs=30, device="cpu"):
     model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -152,7 +185,7 @@ def train_model(model, train_loader, lr=1e-3, epochs=30, device="cpu"):
             pred = model(x_seq, x_static)
             loss = loss_fn(pred, y)
 
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
 
@@ -171,20 +204,33 @@ def predict(model, loader, device="cpu"):
     return np.concatenate(preds), np.concatenate(ys)
 
 
-def run_lstm_global(df: pd.DataFrame, history_days: int,
-                    seq_features: list,
-                    static_features: list = None,
-                    target_col="rmssd",
-                    hidden_dim=64, epochs=40, batch_size=64, lr=1e-3,
-                    device=None, seed=42):
+# =====================================================
+# 7) One run
+# =====================================================
+def run_lstm_global(
+    df: pd.DataFrame,
+    history_days: int,
+    seq_features: list,
+    static_features: list = None,
+    target_col="rmssd",
+    hidden_dim=64,
+    epochs=40,
+    batch_size=64,
+    lr=1e-3,
+    device=None,
+    seed=SEED,
+):
     if static_features is None:
         static_features = ["age", "sex"]
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    torch.manual_seed(seed)
+    # Re-seed at the start of every run (so each run is reproducible independent of loop order)
+    random.seed(seed)
     np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
     df = prepare_df(df)
 
@@ -192,32 +238,49 @@ def run_lstm_global(df: pd.DataFrame, history_days: int,
         df, history_days, seq_features, static_features, target_col=target_col
     )
 
-    # Scale using train only
+    # ---- Scale train-only ----
     seq_scaler = StandardScaler()
     static_scaler = StandardScaler()
     y_scaler = StandardScaler()
 
     N, L, F = X_seq_tr.shape
-    X_seq_tr_2d = X_seq_tr.reshape(N * L, F)
-    seq_scaler.fit(X_seq_tr_2d)
+    seq_scaler.fit(X_seq_tr.reshape(N * L, F))
     static_scaler.fit(X_static_tr)
     y_scaler.fit(y_tr.reshape(-1, 1))
 
-    X_seq_tr = seq_scaler.transform(X_seq_tr_2d).reshape(N, L, F)
-    X_seq_te = seq_scaler.transform(X_seq_te.reshape(X_seq_te.shape[0] * L, F)).reshape(X_seq_te.shape[0], L, F)
+    X_seq_tr_s = seq_scaler.transform(X_seq_tr.reshape(N * L, F)).reshape(N, L, F)
+    X_seq_te_s = seq_scaler.transform(X_seq_te.reshape(X_seq_te.shape[0] * L, F)).reshape(X_seq_te.shape[0], L, F)
 
-    X_static_tr = static_scaler.transform(X_static_tr)
-    X_static_te = static_scaler.transform(X_static_te)
+    X_static_tr_s = static_scaler.transform(X_static_tr)
+    X_static_te_s = static_scaler.transform(X_static_te)
 
     y_tr_s = y_scaler.transform(y_tr.reshape(-1, 1)).ravel()
     y_te_s = y_scaler.transform(y_te.reshape(-1, 1)).ravel()
 
-    train_ds = SeqDataset(X_seq_tr, X_static_tr, y_tr_s)
-    test_ds  = SeqDataset(X_seq_te, X_static_te, y_te_s)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
-    test_loader  = DataLoader(test_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+    train_ds = SeqDataset(X_seq_tr_s, X_static_tr_s, y_tr_s)
+    test_ds  = SeqDataset(X_seq_te_s, X_static_te_s, y_te_s)
 
-    model = GlobalLSTM(seq_input_dim=F, static_dim=X_static_tr.shape[1], hidden_dim=hidden_dim)
+    # Deterministic shuffling
+    g = torch.Generator()
+    g.manual_seed(seed)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=g,
+        num_workers=0,   # important for determinism
+        drop_last=False
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        drop_last=False
+    )
+
+    model = GlobalLSTM(seq_input_dim=F, static_dim=X_static_tr_s.shape[1], hidden_dim=hidden_dim)
 
     train_model(model, train_loader, lr=lr, epochs=epochs, device=device)
 
@@ -228,23 +291,18 @@ def run_lstm_global(df: pd.DataFrame, history_days: int,
     y_true = y_scaler.inverse_transform(y_s.reshape(-1, 1)).ravel()
 
     # Metrics
-    mae = mean_absolute_error(y_true, pred)
-    rmse = mean_squared_error(y_true, pred)  # true RMSE
-    r2 = r2_score(y_true, pred)
+    mae = float(mean_absolute_error(y_true, pred))
+    rmse = float(np.sqrt(mean_squared_error(y_true, pred)))  # FIXED: true RMSE
+    r2 = float(r2_score(y_true, pred))
 
-    # Pearson r (robust to missing/constant cases)
-    try:
-        from scipy.stats import pearsonr
-        r, _ = pearsonr(y_true, pred)
-    except Exception:
-        # fallback: numpy corrcoef; returns nan if constant
-        if np.std(y_true) == 0 or np.std(pred) == 0:
-            r = np.nan
-        else:
-            r = float(np.corrcoef(y_true, pred)[0, 1])
+    # Pearson r (robust)
+    if np.std(y_true) == 0 or np.std(pred) == 0:
+        r = np.nan
+    else:
+        r = float(np.corrcoef(y_true, pred)[0, 1])
 
     return {
-        "history_days": history_days,
+        "history_days": int(history_days),
         "feature_set": "+".join(seq_features),
         "mae": mae,
         "rmse": rmse,
@@ -255,31 +313,38 @@ def run_lstm_global(df: pd.DataFrame, history_days: int,
     }
 
 
-# -----------------------------
-# 6) Run for 1/7/14 × feature sets
-# -----------------------------
+# =====================================================
+# 8) Run grid
+# =====================================================
 FEATURE_SETS = [
-    # keep weekday in all runs (remove if you don't want it)
     ["rmssd"],
     ["rmssd", "resting_hr"],
     ["rmssd", "resting_hr", "steps"],
     ["rmssd", "resting_hr", "steps", "calories"],
 ]
 
-def run_all_windows_and_features(df: pd.DataFrame, history_days_list=(1, 7, 14), epochs=60):
+def run_all_windows_and_features(df: pd.DataFrame, history_days_list=(1, 7, 14), epochs=60, seed=SEED):
     results = []
     for hd in history_days_list:
         for seq_features in FEATURE_SETS:
-            res = run_lstm_global(
-                df,
-                history_days=hd,
-                seq_features=seq_features,
-                epochs=epochs
+            results.append(
+                run_lstm_global(
+                    df,
+                    history_days=hd,
+                    seq_features=seq_features,
+                    epochs=epochs,
+                    seed=seed
+                )
             )
-            results.append(res)
 
-    out = pd.DataFrame(results).sort_values(["history_days", "feature_set"])
+    out = (
+        pd.DataFrame(results)
+        .sort_values(["history_days", "feature_set"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+
     print(out[["history_days", "feature_set", "n_train", "n_test", "mae", "rmse", "r2", "pearson_r"]].to_string(index=False))
+    return out
 
 
 # Example usage:
